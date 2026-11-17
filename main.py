@@ -21,7 +21,12 @@ console-only and console-rolling-midnight launches enter the peak and
 shape pools, because PC-simultaneous launches peak at hour 1 while
 console launches peak in the evening, and mixing the two blurs both.
 The console peak ratio uses a narrower kernel, since the ratio falls as
-hour-1 grows, and is clamped to [1, 6]. Nothing is hardcoded about any
+hour-1 grows, and is clamped to [1, 6]. Round 2: the console shape uses
+a 20%-trimmed weighted mean (steadier than the median with ~10 pool
+rows), and the console median is pulled 25% of the way toward the
+mixed-pool forecast's median, which corrects the class-aware model's
+systematic morning over-prediction (hours 3-13) for console targets.
+Nothing is hardcoded about any
 one game: every number the forecast uses is estimated from the
 comparables in the case file itself, and the target's class is read from
 its own notes (platform clause after "released ... on", unlock wording).
@@ -127,6 +132,29 @@ def weighted_quantile(pairs, tau):
         if acc >= tau * total:
             return x
     return ordered[-1][1]
+
+
+def trimmed_weighted_mean(pairs, trim=0.2):
+    """The weighted mean and standard deviation of (weight, value) pairs
+    after dropping the lightest `trim` fraction of total weight from
+    each tail of the value distribution. With only ~10 pool rows, the
+    plain weighted median is noisy; the trimmed mean is steadier, and
+    the weighted standard deviation is the matching spread."""
+    ordered = sorted(pairs, key=lambda pair: pair[1])
+    total = sum(w for w, _ in ordered)
+    cut = trim * total
+    acc = 0.0
+    keep = []
+    for w, x in ordered:
+        if acc >= cut and acc + w <= total - cut:
+            keep.append((w, x))
+        acc += w
+    if len(keep) < 3:
+        keep = pairs
+    sw = sum(w for w, _ in keep)
+    mean = sum(w * x for w, x in keep) / sw
+    var = sum(w * (x - mean) ** 2 for w, x in keep) / sw
+    return mean, math.sqrt(max(0.0, var))
 
 
 def release_day(comp):
@@ -290,9 +318,12 @@ def peak_shape_console(v1, pool):
                  for row in clean if h in row["curve"] and row["peak"] > 0]
         if not shape:
             continue
-        centre = weighted_median(shape)
-        spread = max(MIN_SHAPE_SIGMA,
-                     (weighted_quantile(shape, 0.75) - weighted_quantile(shape, 0.25)) / 1.349)
+        # Round 2: trimmed mean + weighted std instead of the median +
+        # IQR/1.349 -- steadier with ~10 pool rows (LOO clean-console
+        # 0.1412 -> 0.1393 on its own, and it stacks with the median
+        # shift below).
+        centre, spread = trimmed_weighted_mean(shape)
+        spread = max(MIN_SHAPE_SIGMA, spread)
         sigma = math.sqrt(CLASS_SIGMA_PEAK ** 2 + spread ** 2)
         out[h] = [math.exp(log_peak + centre + z * sigma) for z in Z]
     return out if len(out) == 23 else None
@@ -348,6 +379,26 @@ def kernel_forecast(v1, pool):
     return out if len(out) == 23 else None
 
 
+def blend_median_toward(quantiles, reference, weight):
+    """Shift each hour's quantiles toward a reference forecast's median
+    by `weight` in log space, keeping this forecast's spreads. Round 2:
+    the class-aware median over-predicts the morning hours for console
+    targets (median log-error +0.15 to +0.26 at hours 3-13), and the
+    mixed-pool forecast's median sits lower there; pulling the median
+    25% of the way toward it corrects most of that bias without
+    touching the spreads (LOO clean-console 0.1412 -> 0.1281 on its
+    own; combined with the trimmed shape below, 0.1254)."""
+    out = {}
+    for h, qs in quantiles.items():
+        ref = reference.get(h)
+        if ref is None:
+            out[h] = qs
+            continue
+        shift = weight * (math.log(max(1e-9, ref[2])) - math.log(max(1e-9, qs[2])))
+        out[h] = [q * math.exp(shift) for q in qs]
+    return out
+
+
 def persistence_forecast(v1):
     """Last fallback: the house baseline's flat persistence forecast."""
     p1 = max(1, v1)
@@ -363,6 +414,14 @@ def forecast_case(case):
     quantiles = None
     if pool and target_class == "console":
         quantiles = peak_shape_console(v1, pool)
+        if quantiles is None and is_clean_target(v1, pre):
+            quantiles = peak_shape_forecast(v1, pool)
+        if quantiles is None:
+            quantiles = kernel_forecast(v1, pool)
+        if quantiles is not None:
+            mixed = peak_shape_forecast(v1, pool)
+            if mixed is not None:
+                quantiles = blend_median_toward(quantiles, mixed, 0.25)
     if quantiles is None and pool and is_clean_target(v1, pre):
         quantiles = peak_shape_forecast(v1, pool)
     if quantiles is None and pool:
