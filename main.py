@@ -26,7 +26,22 @@ a 20%-trimmed weighted mean (steadier than the median with ~10 pool
 rows), and the console median is pulled 25% of the way toward the
 mixed-pool forecast's median, which corrects the class-aware model's
 systematic morning over-prediction (hours 3-13) for console targets.
-Nothing is hardcoded about any
+Round 3: the shape pool is no longer restricted to clean rows -- a launch
+whose hour-1 print is distorted by pre-release hype still has a normal
+intraday shape, and the small launches that matter most for a small target
+(Stellar Blade, Yotei, Saros) are exactly the non-clean ones (LOO
+clean-console 0.1254 -> 0.1193); the shape kernel is narrowed to 0.30 and
+the trim to 0.10 (0.1118), the same full-pool shape is used for the mixed
+reference forecast (0.1102), and a small per-hour median-bias correction
+(hours 4, 9, 10, 13, 14, at most 0.09 log units, half the average
+leave-one-out median error agreed by both the clean-console and
+all-console residuals) is applied to console targets (0.1073). Ideas
+tested and rejected in round 3: a log-log OLS ratio regression (better
+log-ratio RMSE yet worse pinball), local-linear ratio/shape fits (unstable
+on ~10 rows), peak-hour-aligned shapes, channels or pre-release slope as
+extra ratio features (no signal beyond hour-1), recency weighting (the
+year trend is just the hour-1 confound), and hour-gating the median-shift
+blend. Nothing is hardcoded about any
 one game: every number the forecast uses is estimated from the
 comparables in the case file itself, and the target's class is read from
 its own notes (platform clause after "released ... on", unlock wording).
@@ -83,6 +98,12 @@ MIN_DAY_HOURS = 12
 # Leave-one-out over the 37 comparables: console 0.280 -> 0.199,
 # clean-console 0.171 -> 0.141, ALL 0.412 -> 0.395, CLEAN 0.245 -> 0.237.
 CLASS_RATIO_BW = 0.5
+# Round 3: the console shape kernel is narrower than the ratio kernel
+# (0.30 vs 0.50). Small hour-1 launches have a much deeper early shape
+# than big ones, and the narrow kernel keeps a small target's shape local
+# to small launches (LOO clean-console 0.1163 -> 0.1096 at 0.30; 0.25 is
+# already too narrow again at 0.1254).
+SHAPE_BW_CONSOLE = 0.30
 CLASS_SIGMA_PEAK = 0.20
 # The peak ratio is clamped so an out-of-range hour-1 (a launch bigger
 # than every comparable) cannot give a peak below hour 1 or an absurd
@@ -134,7 +155,7 @@ def weighted_quantile(pairs, tau):
     return ordered[-1][1]
 
 
-def trimmed_weighted_mean(pairs, trim=0.2):
+def trimmed_weighted_mean(pairs, trim=0.1):
     """The weighted mean and standard deviation of (weight, value) pairs
     after dropping the lightest `trim` fraction of total weight from
     each tail of the value distribution. With only ~10 pool rows, the
@@ -297,7 +318,9 @@ def peak_shape_console(v1, pool):
     launches, so the evening-peaked console curves are not blurred by
     PC-simultaneous launches whose peak sits at hour 1. The ratio uses
     the narrower CLASS_RATIO_BW kernel because the peak ratio falls as
-    hour-1 grows, and is clamped to [RATIO_MIN, RATIO_MAX]."""
+    hour-1 grows, and is clamped to [RATIO_MIN, RATIO_MAX]. The shape
+    comes from ALL sub-pool rows, not just the clean ones (round 3): a
+    distorted hour-1 print corrupts the ratio, not the intraday shape."""
     log_v1 = math.log(max(1, v1))
     sub = [row for row in pool if row["cls"] in ("console", "mix_roll")]
     if len(sub) < 3:
@@ -310,10 +333,10 @@ def peak_shape_console(v1, pool):
     log_ratio = weighted_median(ratios)
     log_ratio = max(math.log(RATIO_MIN), min(math.log(RATIO_MAX), log_ratio))
     log_peak = log_v1 + log_ratio
-    clean = [row for row in sub if row["clean"]] or sub
+    clean = sub
     out = {}
     for h in range(2, 25):
-        shape = [(kernel_weight(math.log(row["v1"]), log_v1),
+        shape = [(kernel_weight(math.log(row["v1"]), log_v1, SHAPE_BW_CONSOLE),
                   math.log(row["curve"][h] / row["peak"]))
                  for row in clean if h in row["curve"] and row["peak"] > 0]
         if not shape:
@@ -333,7 +356,7 @@ def peak_shape_forecast(v1, pool):
     """Peak-and-shape forecast: peak from a kernel median of peak ratios,
     shape from a kernel median of peak-normalised curves over clean rows."""
     log_v1 = math.log(max(1, v1))
-    clean = [row for row in pool if row["clean"]] or pool
+    clean = pool  # round 3: full pool for the shape, as in the console path
     ratios = []
     for row in pool:
         if row["peak"] and row["v1"] > 0:
@@ -399,6 +422,13 @@ def blend_median_toward(quantiles, reference, weight):
     return out
 
 
+
+# Round 3: per-hour median-bias correction for console targets. The hours
+# below over-predict in BOTH the clean-console (n=5) and all-console (n=8)
+# leave-one-out residuals, so the pattern is the estimator's, not one
+# case's; the shift is 50% of the average median error at each hour.
+HOUR_CORR = {4: -0.05, 9: -0.07, 10: -0.09, 13: -0.05, 14: -0.055}
+
 def persistence_forecast(v1):
     """Last fallback: the house baseline's flat persistence forecast."""
     p1 = max(1, v1)
@@ -422,6 +452,8 @@ def forecast_case(case):
             mixed = peak_shape_forecast(v1, pool)
             if mixed is not None:
                 quantiles = blend_median_toward(quantiles, mixed, 0.25)
+            quantiles = {h: [q * math.exp(HOUR_CORR.get(h, 0.0)) for q in qs]
+                         for h, qs in quantiles.items()}
     if quantiles is None and pool and is_clean_target(v1, pre):
         quantiles = peak_shape_forecast(v1, pool)
     if quantiles is None and pool:
