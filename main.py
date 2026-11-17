@@ -16,8 +16,15 @@ pre-release peak far above hour 1, as with late unlocks and beta days),
 the peak-and-shape split is unreliable, so the program falls back to a
 plain kernel regression of each hour's log viewers on log hour-1 viewers;
 and with no usable comparables at all it falls back to the persistence
-baseline. Nothing is hardcoded about any one game: every number the
-forecast uses is estimated from the comparables in the case file itself.
+baseline. Console targets get a class-aware variant instead: only
+console-only and console-rolling-midnight launches enter the peak and
+shape pools, because PC-simultaneous launches peak at hour 1 while
+console launches peak in the evening, and mixing the two blurs both.
+The console peak ratio uses a narrower kernel, since the ratio falls as
+hour-1 grows, and is clamped to [1, 6]. Nothing is hardcoded about any
+one game: every number the forecast uses is estimated from the
+comparables in the case file itself, and the target's class is read from
+its own notes (platform clause after "released ... on", unlock wording).
 
 Runtime: `python3 -P -s /bot/main.py`, Python 3.13 standard library only,
 no network, no files outside the case given. Deterministic: fixed
@@ -65,6 +72,18 @@ CLEAN_MIN_V1 = 10000
 CLEAN_MAX_PRE_RATIO = 3.0
 # A comparable joins the pool only when its release day is this complete.
 MIN_DAY_HOURS = 12
+# Console targets (the practice cases and the GTA VI final) get a
+# class-aware peak-shape: only console-only and console-rolling launches
+# in the pool, a narrower ratio kernel, and a narrower peak spread.
+# Leave-one-out over the 37 comparables: console 0.280 -> 0.199,
+# clean-console 0.171 -> 0.141, ALL 0.412 -> 0.395, CLEAN 0.245 -> 0.237.
+CLASS_RATIO_BW = 0.5
+CLASS_SIGMA_PEAK = 0.20
+# The peak ratio is clamped so an out-of-range hour-1 (a launch bigger
+# than every comparable) cannot give a peak below hour 1 or an absurd
+# multiple of it.
+RATIO_MIN = 1.0
+RATIO_MAX = 6.0
 
 
 def parse_ts(text):
@@ -124,6 +143,59 @@ def release_day(comp):
     return out
 
 
+def classify_launch(platforms, unlock):
+    """A comparable's launch class from its 'platforms' and 'unlock'
+    text: 'console' (no PC), 'mix_roll' (PC present, consoles unlock
+    rolling-midnight-local), 'pc_sim' (PC present, one simultaneous
+    global unlock), 'mix_other' (PC present, pattern not recognised)."""
+    plat = (platforms or "").lower()
+    unl = (unlock or "").lower()
+    has_pc = "pc" in plat
+    rolling = ("rolling" in unl) or ("midnight local" in unl)
+    simult = ("simultaneous" in unl) or ("single global" in unl)
+    if not has_pc:
+        return "console"
+    if rolling and not simult:
+        return "mix_roll"
+    if simult and not rolling:
+        return "pc_sim"
+    return "mix_other"
+
+
+def classify_notes(notes):
+    """The target's launch class from its case notes (the same wording
+    the real case files carry). The platform clause is the text after
+    'released <date> on ' up to the first '(' or ';' -- the parenthetical
+    may mention a later PC port, which must not count. The unlock is
+    'rolling'/'midnight local' versus 'single global'/'simultaneous'
+    anywhere in the notes."""
+    text = notes or ""
+    low = text.lower()
+    plat = ""
+    idx = low.find("released ")
+    if idx >= 0:
+        rest = text[idx + len("released "):]
+        on = rest.lower().find(" on ")
+        if on >= 0:
+            clause = rest[on + 4:]
+            cut = len(clause)
+            for sep in ("(", ";"):
+                j = clause.find(sep)
+                if 0 <= j < cut:
+                    cut = j
+            plat = clause[:cut]
+    has_pc = "pc" in plat.lower()
+    rolling = ("rolling" in low) or ("midnight local" in low)
+    simult = ("simultaneous" in low) or ("single global" in low)
+    if not has_pc:
+        return "console"
+    if rolling and not simult:
+        return "mix_roll"
+    if simult and not rolling:
+        return "pc_sim"
+    return "mix_other"
+
+
 def pre_peak(comp_hourly, day, days=7):
     """The highest hourly viewers in the `days` before the release day."""
     best = 0
@@ -165,6 +237,7 @@ def build_pool(case):
             "peak": peak,
             "pre_peak": pre,
             "clean": clean,
+            "cls": classify_launch(comp.get("platforms"), comp.get("unlock")),
         })
     return pool
 
@@ -184,10 +257,45 @@ def is_clean_target(v1, pre):
     return v1 >= CLEAN_MIN_V1 and (pre or 0) <= CLEAN_MAX_PRE_RATIO * v1
 
 
-def kernel_weight(log_v1, target_log_v1):
+def kernel_weight(log_v1, target_log_v1, bw=BANDWIDTH):
     """The Gaussian kernel weight of a launch at log hour-1 `log_v1`."""
-    d = (log_v1 - target_log_v1) / BANDWIDTH
+    d = (log_v1 - target_log_v1) / bw
     return math.exp(-0.5 * d * d)
+
+
+def peak_shape_console(v1, pool):
+    """Class-aware peak-shape for console targets: the peak ratio and
+    the shape come only from console-only and console-rolling-midnight
+    launches, so the evening-peaked console curves are not blurred by
+    PC-simultaneous launches whose peak sits at hour 1. The ratio uses
+    the narrower CLASS_RATIO_BW kernel because the peak ratio falls as
+    hour-1 grows, and is clamped to [RATIO_MIN, RATIO_MAX]."""
+    log_v1 = math.log(max(1, v1))
+    sub = [row for row in pool if row["cls"] in ("console", "mix_roll")]
+    if len(sub) < 3:
+        sub = pool
+    ratios = [(kernel_weight(math.log(row["v1"]), log_v1, CLASS_RATIO_BW),
+               math.log(row["peak"] / row["v1"]))
+              for row in sub if row["peak"] and row["v1"] > 0]
+    if not ratios:
+        return None
+    log_ratio = weighted_median(ratios)
+    log_ratio = max(math.log(RATIO_MIN), min(math.log(RATIO_MAX), log_ratio))
+    log_peak = log_v1 + log_ratio
+    clean = [row for row in sub if row["clean"]] or sub
+    out = {}
+    for h in range(2, 25):
+        shape = [(kernel_weight(math.log(row["v1"]), log_v1),
+                  math.log(row["curve"][h] / row["peak"]))
+                 for row in clean if h in row["curve"] and row["peak"] > 0]
+        if not shape:
+            continue
+        centre = weighted_median(shape)
+        spread = max(MIN_SHAPE_SIGMA,
+                     (weighted_quantile(shape, 0.75) - weighted_quantile(shape, 0.25)) / 1.349)
+        sigma = math.sqrt(CLASS_SIGMA_PEAK ** 2 + spread ** 2)
+        out[h] = [math.exp(log_peak + centre + z * sigma) for z in Z]
+    return out if len(out) == 23 else None
 
 
 def peak_shape_forecast(v1, pool):
@@ -251,8 +359,11 @@ def forecast_case(case):
     """One case's forecast: {"hours": [{"hour": h, "q": [...]} * 23]}."""
     v1, pre = case_features(case)
     pool = build_pool(case)
+    target_class = classify_notes(case.get("notes") or "")
     quantiles = None
-    if pool and is_clean_target(v1, pre):
+    if pool and target_class == "console":
+        quantiles = peak_shape_console(v1, pool)
+    if quantiles is None and pool and is_clean_target(v1, pre):
         quantiles = peak_shape_forecast(v1, pool)
     if quantiles is None and pool:
         quantiles = kernel_forecast(v1, pool)
