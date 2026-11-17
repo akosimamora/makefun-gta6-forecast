@@ -47,7 +47,12 @@ Z = [-1.6448536269514722, -0.6744897501960817, 0.0, 0.6744897501960817,
 # of two of the case's hour-1 print carry most of the weight.
 BANDWIDTH = 0.7
 # Log-space uncertainty of the day's peak around its kernel estimate.
-SIGMA_PEAK = 0.35
+# Swept 0.35-0.39 on leave-one-out over the 37 comparables: 0.37 is the
+# shallow optimum (ALL 0.41227, CLEAN 0.24498, both a touch better than
+# 0.35) and lifts the 5-95% coverage from 0.859 toward the nominal 0.90
+# (0.867 overall, 0.909 on clean launches); wider than that starts to
+# cost on the biggest launches.
+SIGMA_PEAK = 0.37
 # Smallest log-space spread any hour may carry, and the floor the shape
 # spread of an hour may take.
 MIN_SIGMA = 0.18
