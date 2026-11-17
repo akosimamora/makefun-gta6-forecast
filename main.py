@@ -41,7 +41,21 @@ log-ratio RMSE yet worse pinball), local-linear ratio/shape fits (unstable
 on ~10 rows), peak-hour-aligned shapes, channels or pre-release slope as
 extra ratio features (no signal beyond hour-1), recency weighting (the
 year trend is just the hour-1 confound), and hour-gating the median-shift
-blend. Nothing is hardcoded about any
+blend. Round 4 (final-targeted, not practice-board-targeted): the shape
+kernel is widened, but only in the top region (the target within 0.5 log
+units of the largest comparable) until the shape kernel's effective sample
+size reaches 3 -- at a mega launch far above every comparable the shape
+rested on two rows (ESS ~2), and widening pulls the morning shape toward
+the average of several big launches (LOO clean-console 0.1073 -> 0.1056,
+all of it from the biggest clean launch; the truncated-pool extrapolation
+test improves too). Tested and rejected in round 4: a global trim
+kept-weight guard (hurts mid-size launches), fading the per-hour bias
+correction or the median-shift blend with v1 (no effect), widening the
+peak spread beyond the pool max (helps only when the peak is already
+wrong, costs when it is right), and the log-log OLS ratio regression
+again -- it extrapolates the peak ratio toward 1.0 at GTA VI scale
+(1.06 at v1 1.2M), contradicting the two biggest launches (1.30, 1.34),
+while the kernel median saturates sensibly at 1.25-1.30. Nothing is hardcoded about any
 one game: every number the forecast uses is estimated from the
 comparables in the case file itself, and the target's class is read from
 its own notes (platform clause after "released ... on", unlock wording).
@@ -334,9 +348,18 @@ def peak_shape_console(v1, pool):
     log_ratio = max(math.log(RATIO_MIN), min(math.log(RATIO_MAX), log_ratio))
     log_peak = log_v1 + log_ratio
     clean = sub
+    _top = log_v1 >= max(math.log(row["v1"]) for row in sub if row["v1"] > 0) - 0.5
+    shape_bw = SHAPE_BW_CONSOLE
+    if _top:
+        while shape_bw < 0.70:
+            _ws = [kernel_weight(math.log(row["v1"]), log_v1, shape_bw) for row in sub]
+            _sw = sum(_ws)
+            if _sw > 0 and _sw * _sw / sum(w * w for w in _ws) >= 3.0:
+                break
+            shape_bw = round(shape_bw + 0.15, 2)
     out = {}
     for h in range(2, 25):
-        shape = [(kernel_weight(math.log(row["v1"]), log_v1, SHAPE_BW_CONSOLE),
+        shape = [(kernel_weight(math.log(row["v1"]), log_v1, shape_bw),
                   math.log(row["curve"][h] / row["peak"]))
                  for row in clean if h in row["curve"] and row["peak"] > 0]
         if not shape:
